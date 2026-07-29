@@ -35,8 +35,13 @@ import {
   type ValidationResultSlice,
 } from '~shared/store/tab-store-slices/validation-result-slice';
 
+import {
+  createEditSessionSlice,
+  type EditSessionSlice,
+} from './edit-session-slice';
 import {createGraphDataSlice, type GraphDataSlice} from './graph-data-slice';
 import {createKeyConfigSlice, type KeyConfigSlice} from './key-config-slice';
+import {createModuleDataSlice, type ModuleDataSlice} from './module-data-slice';
 import {createModuleListSlice, type ModuleListSlice} from './module-list-slice';
 import {
   createSubgraphListSlice,
@@ -44,22 +49,20 @@ import {
 } from './subgraph-list-slice';
 import {createVisualizerSlice, type VisualizerSlice} from './visualizer-slice';
 
-// ── Store type ──────────────────────────────────────────────────────────────
-
 export type GraphDesignerStore = UsecaseSelectionSlice &
   GraphDataSlice &
+  EditSessionSlice &
   VisualizerSlice &
   SubsystemSlice &
   KeyConfigSlice &
   ValidationResultSlice &
   ModuleListSlice &
+  ModuleDataSlice &
   SubgraphListSlice &
   PropertiesViewSlice &
   PanelLayoutSlice &
   PanelTabRegistrySlice &
   SearchSlice;
-
-// ── Factory ─────────────────────────────────────────────────────────────────
 
 export function createGraphDesignerStore(
   _tabId: string,
@@ -71,11 +74,13 @@ export function createGraphDesignerStore(
   return createStore<GraphDesignerStore>((set, get) => ({
     ...createUsecaseSelectionSlice(set),
     ...createGraphDataSlice(set, get, projectId),
+    ...createEditSessionSlice(set, projectId),
     ...createVisualizerSlice(set),
     ...createSubsystemSlice(set, get),
     ...createKeyConfigSlice(set),
     ...createValidationResultSlice(set, get),
     ...createModuleListSlice(set, get, projectId),
+    ...createModuleDataSlice(set, get, projectId),
     ...createSubgraphListSlice(set, get, projectId),
     ...createPropertiesViewSlice(set),
     ...createPanelLayoutSlice(set),

@@ -3,7 +3,14 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import {
+  createRef,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 
 import {
   Clipboard,
@@ -21,13 +28,20 @@ import {
   Wand2,
 } from 'lucide-react';
 
-import type {LevelView} from '~entities/graph';
-import {getSystemIdsFromFormattedUsecases} from '~entities/usecases';
-import {useGraphDesignerStoreShallow} from '~features/graph-designer/model/graph-designer-store-context';
+import {type LevelView, NODE_KIND, type NodeKind} from '~entities/graph';
+import {
+  getSystemIdsFromFormattedUsecases,
+  type UsecaseCategory,
+} from '~entities/usecases';
+import {
+  GraphDesignerStoreContext,
+  useGraphDesignerStore,
+  useGraphDesignerStoreShallow,
+} from '~features/graph-designer';
 import {SearchComponent} from '~features/search-component';
 import {
-  type UsecaseCategory,
   UsecaseSelectionControl,
+  useWorkflowUsecaseData,
 } from '~features/usecase-selection';
 import {
   type SearchHighlights,
@@ -35,11 +49,20 @@ import {
   type ViewportState,
   type XY,
 } from '~features/usecase-visualizer';
+import {useUserPreferences} from '~shared/config/hooks';
+import {WORKFLOW_TYPES} from '~shared/config/user-preferences-types';
 import {showToast} from '~shared/controls/global-toaster';
 import {logger} from '~shared/lib/logger';
 import {useRegisterSideNav, useSideNav} from '~shared/lib/side-nav';
+import {useProjectLayoutStore} from '~shared/store';
+import {
+  ModuleDataTab,
+  type ModuleDataTabHandle,
+} from '~widgets/module-data-tab';
+import {tabLayoutService} from '~widgets/project-layout/project-layout-manager';
 
 import {applyCollapses} from '../lib/apply-collapses';
+import {applyPortVisibility} from '../lib/apply-port-visibility';
 import {applyPositionOverrides} from '../lib/apply-position-overrides';
 import {
   computeContainsMatchIds,
@@ -52,7 +75,7 @@ import {layoutLevelView} from '../lib/level-view-layout';
 import {DisplayOptionsPopover} from './display-options-popover';
 
 interface GraphDesignerProps {
-  projectGroupId: string;
+  projectId: string;
   screenshotRegistry: Map<string, () => Promise<string | null>>;
   tabId?: string;
   usecaseData: UsecaseCategory[];
@@ -61,7 +84,7 @@ interface GraphDesignerProps {
 const EMPTY_SET: ReadonlySet<number> = new Set<number>();
 
 const GraphDesigner: React.FC<GraphDesignerProps> = ({
-  projectGroupId,
+  projectId,
   screenshotRegistry,
   tabId,
   usecaseData: initialUsecaseData,
@@ -76,6 +99,23 @@ const GraphDesigner: React.FC<GraphDesignerProps> = ({
 
   const usecaseData = initialUsecaseData;
 
+  const {preferences, updatePreference} = useUserPreferences();
+  const effectivePortVisibilityMode =
+    preferences.visualization.viewMode === 'detailed'
+      ? preferences.display.portVisibilityMode
+      : 'active';
+  const {workflowLevel, workflowType} = preferences.usecases;
+
+  const {isLoading: isWorkflowLoading, resolvedData} = useWorkflowUsecaseData(
+    projectId,
+    workflowType,
+    workflowLevel,
+    usecaseData,
+  );
+
+  // Derived flags for UsecaseSelectionControl
+  const isSystemWorkflow = workflowType === WORKFLOW_TYPES.SYSTEM;
+
   // Graph data from store
   const graphData = useGraphDesignerStoreShallow((s) => s.graphData);
   const graphDataError = useGraphDesignerStoreShallow((s) => s.graphDataError);
@@ -86,6 +126,20 @@ const GraphDesigner: React.FC<GraphDesignerProps> = ({
   const levelView = useGraphDesignerStoreShallow((s) => s.levelView);
   const setLevelView = useGraphDesignerStoreShallow((s) => s.setLevelView);
   const clearLevelView = useGraphDesignerStoreShallow((s) => s.clearLevelView);
+
+  // Store API for imperative action calls and provider value for new tabs.
+  const store = useGraphDesignerStore();
+
+  // Keyed by moduleId so the tab-close callback can reach the specific
+  // ModuleDataTab instance's confirmClose() handle.
+  const moduleDataTabRefs = useRef(
+    new Map<string, React.RefObject<ModuleDataTabHandle | null>>(),
+  );
+
+  // Synchronous lock so a second double-click on the same module during the
+  // in-flight queryModuleData() await can't also pass the moduleOpenTabs
+  // guard and create a duplicate tab.
+  const pendingModuleOpensRef = useRef(new Set<string>());
 
   // Collapse, position-override, and viewport state (consumer-owned).
   const [collapseByLevel, setCollapseByLevel] = useState<
@@ -176,11 +230,11 @@ const GraphDesigner: React.FC<GraphDesignerProps> = ({
   const handleScreenshotReady = (
     screenshotFn: () => Promise<string | null>,
   ) => {
-    screenshotRegistry.set(projectGroupId, screenshotFn);
+    screenshotRegistry.set(projectId, screenshotFn);
     logger.verbose('Screenshot function registered', {
       action: 'register_screenshot',
       component: 'GraphDesigner',
-      projectId: projectGroupId,
+      projectId,
     });
   };
 
@@ -265,14 +319,14 @@ const GraphDesigner: React.FC<GraphDesignerProps> = ({
   // Cleanup screenshot registration on unmount
   useEffect(() => {
     return () => {
-      screenshotRegistry.delete(projectGroupId);
+      screenshotRegistry.delete(projectId);
       logger.verbose('Screenshot function unregistered', {
         action: 'unregister_screenshot',
         component: 'GraphDesigner',
-        projectId: projectGroupId,
+        projectId,
       });
     };
-  }, [projectGroupId, screenshotRegistry]);
+  }, [projectId, screenshotRegistry]);
 
   // Effect A — trigger load when selection changes
   useEffect(() => {
@@ -287,40 +341,104 @@ const GraphDesigner: React.FC<GraphDesignerProps> = ({
     }
     const systemIds = getSystemIdsFromFormattedUsecases(
       selectedUsecases,
-      usecaseData,
+      resolvedData,
     );
     if (systemIds.length > 0) {
       void loadGraphData(systemIds);
     }
   }, [
     selectedUsecases,
-    usecaseData,
+    resolvedData,
     clearLevelView,
     loadGraphData,
     resetSearch,
   ]);
 
-  // Effect B — build LevelView when graphData is ready
+  // Effect B — build LevelView when graphData is ready or the port
+  // visibility mode changes. Filtering runs before layoutLevelView so ELK
+  // sizes/packs modules, containers, and subgraphs around the ports that
+  // will actually be visible, instead of the full port count.
   useEffect(() => {
-    if (graphDataStatus !== 'ready' || !graphData || levelView !== null) {
+    if (graphDataStatus !== 'ready' || !graphData) {
       return;
     }
     const gen = ++layoutGenerationRef.current;
     const levelId = selectedUsecases.join(',');
     const unpositioned = buildLevelViewFromGraphData(graphData, levelId);
-    void layoutLevelView(unpositioned).then((lv) => {
+    const filtered = applyPortVisibility(
+      unpositioned,
+      effectivePortVisibilityMode,
+    );
+    void layoutLevelView(filtered).then((lv) => {
       if (layoutGenerationRef.current === gen) {
         setLevelView(lv);
       }
     });
-  }, [graphDataStatus, graphData, levelView, selectedUsecases, setLevelView]);
+  }, [
+    graphDataStatus,
+    graphData,
+    selectedUsecases,
+    setLevelView,
+    effectivePortVisibilityMode,
+  ]);
 
   // Side nav implementation
   const hasSelection = (graph.modules?.length ?? 0) > 0;
   const canUndoRedo = false; // TODO: Support undo/redo stack
 
+  const handleModuleDoubleClick = useCallback(
+    async (nodeId: string, nodeKind: NodeKind, label: string) => {
+      if (nodeKind !== NODE_KIND.MODULE) {
+        return;
+      }
+      const layout = useProjectLayoutStore.getState();
+      const existingTabId = store.getState().moduleOpenTabs[nodeId];
+      if (existingTabId) {
+        layout.setActiveProjectTab(projectId, existingTabId);
+        return;
+      }
+      if (pendingModuleOpensRef.current.has(nodeId)) {
+        return;
+      }
+      pendingModuleOpensRef.current.add(nodeId);
+      try {
+        // TODO: hardcodes selection to the first available CKV/TKV until the
+        // subgraph-header CKV/TKV inheritance selector lands.
+        const ok = await store.getState().queryModuleData(nodeId, label);
+        if (!ok) {
+          return;
+        }
+        const existingAfterFetch = store.getState().moduleOpenTabs[nodeId];
+        if (existingAfterFetch) {
+          layout.setActiveProjectTab(projectId, existingAfterFetch);
+          return;
+        }
+        const moduleDataTabRef = createRef<ModuleDataTabHandle>();
+        moduleDataTabRefs.current.set(nodeId, moduleDataTabRef);
+        const tab = tabLayoutService.createProjectTab(
+          label,
+          <GraphDesignerStoreContext.Provider value={store}>
+            <ModuleDataTab ref={moduleDataTabRef} moduleId={nodeId} />
+          </GraphDesignerStoreContext.Provider>,
+          () => moduleDataTabRef.current?.confirmClose() ?? true,
+          () => {
+            moduleDataTabRefs.current.delete(nodeId);
+            store.getState().setModuleOpenTab(nodeId, null);
+            store.getState().clearModuleData(nodeId);
+          },
+        );
+        store.getState().setModuleOpenTab(nodeId, tab.id);
+        layout.setActiveProjectTab(projectId, tab.id);
+      } finally {
+        pendingModuleOpensRef.current.delete(nodeId);
+      }
+    },
+    [projectId, store],
+  );
+
   const eventHandlers = useMemo(
     () => ({
+      onNodeDoubleClick: handleModuleDoubleClick,
       onNodeDragEnd: ({
         nodeId,
         position,
@@ -355,7 +473,18 @@ const GraphDesigner: React.FC<GraphDesignerProps> = ({
         setViewportByLevel((p) => ({...p, [levelId]: viewport}));
       },
     }),
-    [levelId],
+    [handleModuleDoubleClick, levelId],
+  );
+
+  const displayOptionsContent = useMemo(
+    () => (
+      <DisplayOptionsPopover
+        preferences={preferences}
+        projectId={projectId}
+        updatePreference={updatePreference}
+      />
+    ),
+    [preferences, projectId, updatePreference],
   );
 
   const sideNavItems = useMemo(
@@ -401,7 +530,6 @@ const GraphDesigner: React.FC<GraphDesignerProps> = ({
         shortcut: 'Ctrl+F',
       },
       // Tools group
-
       {
         group: 'Tools',
         icon: Package,
@@ -449,11 +577,11 @@ const GraphDesigner: React.FC<GraphDesignerProps> = ({
         icon: SlidersHorizontal,
         id: 'display-options',
         label: 'Display Options',
-        popoverContent: <DisplayOptionsPopover projectId={projectGroupId} />,
+        popoverContent: displayOptionsContent,
         tooltip: 'Display Options',
       },
     ],
-    [hasSelection, canUndoRedo, projectGroupId],
+    [hasSelection, canUndoRedo, displayOptionsContent],
   );
 
   const sideNavHandlers = useMemo(
@@ -597,10 +725,12 @@ const GraphDesigner: React.FC<GraphDesignerProps> = ({
         }}
       >
         <UsecaseSelectionControl
+          disabled={isSystemWorkflow}
           onSelectedUsecasesChange={setSelectedUsecases}
-          projectId={projectGroupId}
+          projectId={projectId}
+          selectAll={isSystemWorkflow && !isWorkflowLoading}
           selectedUsecases={selectedUsecases}
-          usecaseData={usecaseData}
+          usecaseData={resolvedData}
         />
       </div>
 

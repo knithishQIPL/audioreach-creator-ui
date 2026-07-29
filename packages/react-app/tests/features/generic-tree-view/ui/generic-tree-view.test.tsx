@@ -223,6 +223,36 @@ describe('onUiStateChange emission', () => {
         title="Test"
       />,
     );
+    expect(onUiStateChange).not.toHaveBeenCalledWith(
+      expect.objectContaining({elementValues: expect.anything()}),
+    );
+  });
+
+  it('syncs the auto-selected first param to the store on initial mount', () => {
+    const onUiStateChange = jest.fn();
+    render(
+      <GenericTreeView
+        data={makeData([makeItem('100'), makeItem('200')])}
+        onUiStateChange={onUiStateChange}
+        title="Test"
+      />,
+    );
+    expect(onUiStateChange).toHaveBeenCalledWith({
+      expandedIds: ['100'],
+      selectedIds: ['100'],
+    });
+  });
+
+  it('does not re-sync selectedIds when initialUiState was provided', () => {
+    const onUiStateChange = jest.fn();
+    render(
+      <GenericTreeView
+        data={makeData([makeItem('100')])}
+        initialUiState={makeUiState({selectedIds: []})}
+        onUiStateChange={onUiStateChange}
+        title="Test"
+      />,
+    );
     expect(onUiStateChange).not.toHaveBeenCalled();
   });
 
@@ -340,6 +370,240 @@ describe('re-seed on data prop change', () => {
     });
 
     expect(onUiStateChange).not.toHaveBeenCalled();
+  });
+});
+
+// ── reconcile dirty/set state on Set success ──────────────────────────────────
+
+describe('reconcile dirty/set state on Set success', () => {
+  function makeItemWithGain(id: string, value: string): TreeViewItem {
+    return makeItem(id, {
+      elements: [
+        {isReadOnly: false, name: 'gain', type: 'CONFIG_ELEMENT', value},
+      ],
+    });
+  }
+
+  function makeItemWithTwoElements(
+    id: string,
+    gain: string,
+    volume: string,
+  ): TreeViewItem {
+    return makeItem(id, {
+      elements: [
+        {isReadOnly: false, name: 'gain', type: 'CONFIG_ELEMENT', value: gain},
+        {
+          isReadOnly: false,
+          name: 'volume',
+          type: 'CONFIG_ELEMENT',
+          value: volume,
+        },
+      ],
+    });
+  }
+
+  it('moves a path from dirtyPaths to setPaths when the merged snapshot value matches what was sent, leaving unrelated dirty paths untouched', () => {
+    const onUiStateChange = jest.fn();
+    const data1 = makeData([makeItemWithTwoElements('100', '10', '20')]);
+    const {rerender} = render(
+      <GenericTreeView
+        data={data1}
+        onUiStateChange={onUiStateChange}
+        title="Test"
+      />,
+    );
+
+    fireInputChange('100/gain', '99');
+    act(() => {
+      jest.advanceTimersByTime(200);
+    });
+    fireInputChange('100/volume', '77');
+    act(() => {
+      jest.advanceTimersByTime(200);
+    });
+    onUiStateChange.mockClear();
+
+    // Simulate a Set that only confirmed 100/gain; 100/volume arrives
+    // unchanged in the merged snapshot (backend didn't process it in this
+    // batch).
+    const setSnapshot: TreeViewData = {
+      items: [makeItemWithTwoElements('100', '99', '20')],
+      source: 'set',
+      systemId: data1.systemId,
+    };
+    act(() => {
+      rerender(
+        <GenericTreeView
+          data={setSnapshot}
+          onUiStateChange={onUiStateChange}
+          title="Test"
+        />,
+      );
+    });
+
+    expect(onUiStateChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        dirtyPaths: ['100/volume'],
+        setPaths: ['100/gain'],
+      }),
+    );
+  });
+
+  it('leaves a path in dirtyPaths when the backend did not process it (merged value differs from what was sent)', () => {
+    const onUiStateChange = jest.fn();
+    const data1 = makeData([makeItemWithGain('100', '10')]);
+    const {rerender} = render(
+      <GenericTreeView
+        data={data1}
+        onUiStateChange={onUiStateChange}
+        title="Test"
+      />,
+    );
+
+    fireInputChange('100/gain', '99');
+    act(() => {
+      jest.advanceTimersByTime(200);
+    });
+    onUiStateChange.mockClear();
+
+    // Merged snapshot still shows the pre-edit value — backend never wrote it.
+    const setSnapshot: TreeViewData = {
+      items: [makeItemWithGain('100', '10')],
+      source: 'set',
+      systemId: data1.systemId,
+    };
+    act(() => {
+      rerender(
+        <GenericTreeView
+          data={setSnapshot}
+          onUiStateChange={onUiStateChange}
+          title="Test"
+        />,
+      );
+    });
+
+    expect(onUiStateChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        dirtyPaths: ['100/gain'],
+        setPaths: [],
+      }),
+    );
+  });
+
+  it('Get success still fully re-seeds — reconciliation must not apply on the Get path', () => {
+    const onUiStateChange = jest.fn();
+    const data1 = makeData([makeItemWithGain('100', '10')]);
+    const {rerender} = render(
+      <GenericTreeView
+        data={data1}
+        onUiStateChange={onUiStateChange}
+        title="Test"
+      />,
+    );
+
+    fireInputChange('100/gain', '99');
+    act(() => {
+      jest.advanceTimersByTime(200);
+    });
+    onUiStateChange.mockClear();
+
+    // A Get (source omitted) with a value that would NOT reconcile if treated
+    // as a Set — the full re-seed must still clear dirtyPaths regardless.
+    const getSnapshot = makeData([makeItemWithGain('100', '10')], 'sys-2');
+    act(() => {
+      rerender(
+        <GenericTreeView
+          data={getSnapshot}
+          onUiStateChange={onUiStateChange}
+          title="Test"
+        />,
+      );
+    });
+
+    expect(onUiStateChange).toHaveBeenCalledWith(
+      expect.objectContaining({dirtyPaths: [], setPaths: []}),
+    );
+  });
+
+  it('mounting with initialUiState and a source: "set" data prop does not trigger reconciliation', () => {
+    const onUiStateChange = jest.fn();
+    const data = makeData([makeItemWithGain('100', '10')]);
+    const setData: TreeViewData = {...data, source: 'set'};
+    render(
+      <GenericTreeView
+        data={setData}
+        initialUiState={makeUiState({
+          committedValues: {'100/gain': '10'},
+          dirtyPaths: ['100/gain'],
+          elementValues: {'100/gain': '99'},
+        })}
+        onUiStateChange={onUiStateChange}
+        title="Test"
+      />,
+    );
+
+    expect(onUiStateChange).not.toHaveBeenCalled();
+  });
+
+  it('recomputes array counts wholesale from the merged snapshot on Set', () => {
+    const onUiStateChange = jest.fn();
+    const instance: AnyElementDto = {
+      isReadOnly: false,
+      name: 'val',
+      type: 'CONFIG_ELEMENT',
+      value: '0',
+    };
+    const item1 = makeItem('100', {
+      elements: [
+        {
+          isReadOnly: false,
+          name: 'items',
+          type: 'ELEMENT_TEMPLATE_ARRAY',
+          value: [instance, instance],
+        },
+      ],
+    });
+    const data1 = makeData([item1]);
+    const {rerender} = render(
+      <GenericTreeView
+        data={data1}
+        onUiStateChange={onUiStateChange}
+        title="Test"
+      />,
+    );
+    onUiStateChange.mockClear();
+
+    // Merged snapshot now has 3 instances (e.g. another session added one).
+    const item2 = makeItem('100', {
+      elements: [
+        {
+          isReadOnly: false,
+          name: 'items',
+          type: 'ELEMENT_TEMPLATE_ARRAY',
+          value: [instance, instance, instance],
+        },
+      ],
+    });
+    const setSnapshot: TreeViewData = {
+      items: [item2],
+      source: 'set',
+      systemId: data1.systemId,
+    };
+    act(() => {
+      rerender(
+        <GenericTreeView
+          data={setSnapshot}
+          onUiStateChange={onUiStateChange}
+          title="Test"
+        />,
+      );
+    });
+
+    expect(onUiStateChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        arrayCounts: expect.objectContaining({'100/items': 3}),
+      }),
+    );
   });
 });
 
@@ -768,6 +1032,195 @@ describe('invalidPaths range validation', () => {
     );
     // With invalidPaths non-empty from initialUiState, autoCommit must not fire.
     expect(onCommit).not.toHaveBeenCalled();
+  });
+});
+
+describe('Modified Only / Errors Only filters', () => {
+  function makeItemWithRangedGain(id: string, value = '50'): TreeViewItem {
+    return makeItem(id, {
+      elements: [
+        {
+          isReadOnly: false,
+          max: 100,
+          min: 0,
+          name: 'gain',
+          type: 'CONFIG_ELEMENT',
+          value,
+        },
+      ],
+    });
+  }
+
+  function toggleSwitch(label: string): void {
+    const checkbox = screen
+      .getByText(label)
+      .closest('[data-testid="q-switch"]')
+      ?.querySelector('input[type="checkbox"]');
+    if (!checkbox) {
+      throw new Error(`No checkbox found for switch "${label}"`);
+    }
+    fireEvent.click(checkbox);
+  }
+
+  // The parameter list panel and detail pane can both render a selected
+  // item's name; scope assertions to the list panel's tree via node-text.
+  function listedParamNames(): string[] {
+    return screen
+      .getAllByTestId('node-text')
+      .map((el) => el.textContent)
+      .filter(
+        (text): text is string => text !== null && text.startsWith('Param '),
+      );
+  }
+
+  it('Modified Only switch is absent when no dirty paths exist', () => {
+    render(
+      <GenericTreeView
+        data={makeData([makeItem('100'), makeItem('101')])}
+        title="Test"
+      />,
+    );
+    expect(screen.queryByText('Modified Only')).not.toBeInTheDocument();
+  });
+
+  it('Modified Only switch appears after an edit and hides clean parameters', () => {
+    render(
+      <GenericTreeView
+        data={makeData([makeItem('100'), makeItem('101')])}
+        title="Test"
+      />,
+    );
+
+    fireInputChange('100/gain', '99');
+    act(() => {
+      jest.advanceTimersByTime(200);
+    });
+
+    expect(screen.getByText('Modified Only')).toBeInTheDocument();
+    expect(listedParamNames()).toEqual(['Param 100', 'Param 101']);
+
+    toggleSwitch('Modified Only');
+
+    expect(listedParamNames()).toEqual(['Param 100']);
+  });
+
+  it('Modified Only switch disappears when the last dirty path is cleared', () => {
+    render(
+      <GenericTreeView
+        data={makeData([makeItemWithRangedGain('100', '10')])}
+        title="Test"
+      />,
+    );
+
+    fireInputChange('100/gain', '99');
+    act(() => {
+      jest.advanceTimersByTime(200);
+    });
+    expect(screen.getByText('Modified Only')).toBeInTheDocument();
+
+    fireInputChange('100/gain', '10');
+    act(() => {
+      jest.advanceTimersByTime(200);
+    });
+
+    expect(screen.queryByText('Modified Only')).not.toBeInTheDocument();
+  });
+
+  it('Errors Only switch is absent when no invalid paths exist', () => {
+    render(
+      <GenericTreeView
+        data={makeData([makeItemWithRangedGain('100')])}
+        title="Test"
+      />,
+    );
+    expect(screen.queryByText('Errors Only')).not.toBeInTheDocument();
+  });
+
+  it('Errors Only switch appears on out-of-range input and filters correctly', () => {
+    render(
+      <GenericTreeView
+        data={makeData([
+          makeItemWithRangedGain('100'),
+          makeItemWithRangedGain('101'),
+        ])}
+        title="Test"
+      />,
+    );
+
+    fireInputChange('100/gain', '200');
+    act(() => {
+      jest.advanceTimersByTime(200);
+    });
+
+    expect(screen.getByText('Errors Only')).toBeInTheDocument();
+
+    toggleSwitch('Errors Only');
+
+    expect(listedParamNames()).toEqual(['Param 100']);
+  });
+
+  it('Errors Only switch disappears when the last invalid path is cleared', () => {
+    render(
+      <GenericTreeView
+        data={makeData([makeItemWithRangedGain('100')])}
+        title="Test"
+      />,
+    );
+
+    fireInputChange('100/gain', '200');
+    act(() => {
+      jest.advanceTimersByTime(200);
+    });
+    expect(screen.getByText('Errors Only')).toBeInTheDocument();
+
+    fireInputChange('100/gain', '75');
+    act(() => {
+      jest.advanceTimersByTime(200);
+    });
+
+    expect(screen.queryByText('Errors Only')).not.toBeInTheDocument();
+  });
+
+  it('shows only parameters satisfying both filters when both are active', () => {
+    render(
+      <GenericTreeView
+        data={makeData([
+          makeItemWithRangedGain('100', '10'),
+          makeItemWithRangedGain('101', '10'),
+          makeItemWithRangedGain('102', '10'),
+        ])}
+        initialUiState={makeUiState({
+          committedValues: {
+            '100/gain': '10',
+            '101/gain': '10',
+            '102/gain': '10',
+          },
+          elementValues: {
+            '100/gain': '10',
+            '101/gain': '10',
+            '102/gain': '10',
+          },
+          expandedIds: ['100', '101', '102'],
+          selectedIds: ['100', '101', '102'],
+        })}
+        title="Test"
+      />,
+    );
+
+    // 100: dirty only. 101: dirty and invalid. 102: untouched.
+    fireInputChange('100/gain', '20');
+    act(() => {
+      jest.advanceTimersByTime(200);
+    });
+    fireInputChange('101/gain', '200');
+    act(() => {
+      jest.advanceTimersByTime(200);
+    });
+
+    toggleSwitch('Modified Only');
+    toggleSwitch('Errors Only');
+
+    expect(listedParamNames()).toEqual(['Param 101']);
   });
 });
 

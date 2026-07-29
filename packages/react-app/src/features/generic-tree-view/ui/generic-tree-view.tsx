@@ -16,13 +16,13 @@ import {
 
 import {logger} from '~shared/lib/logger';
 
+import {buildDirtyItems as buildDirtyItemsFrom} from '../lib/build-dirty-items';
 import {buildLengthFormulaMap} from '../lib/build-length-formula-map';
 import {buildMatchSets} from '../lib/build-match-sets';
 import {findElementByKey} from '../lib/find-element-by-key';
 import {isPolicyVisible} from '../lib/is-policy-visible';
 import {itemIdsFromPaths} from '../lib/item-ids-from-paths';
 import {parseHexOrDec} from '../lib/parse-hex-or-dec';
-import {patchElements} from '../lib/patch-elements';
 import {seedFromData} from '../lib/seed-from-data';
 import type {TreeViewData, TreeViewItem} from '../model/tree-view-data';
 import type {GenericTreeViewHandle, GenericTreeViewProps} from '../model/types';
@@ -104,11 +104,75 @@ function GenericTreeViewInner(
   );
 
   const prevDataRef = useRef<TreeViewData | null>(data);
+  // Snapshot of dirty/set state as of the latest render, read inside the
+  // effect below instead of via closure. dirtyPaths/setPaths/elementValues/
+  // committedValues change on every edit; a ref lets the effect read their
+  // current values (comparing what was sent vs. the merged snapshot, per
+  // design.md §9.7) without listing them as deps, which would re-run the
+  // effect on every edit instead of only on `data` changes.
+  const latestUiStateRef = useRef<{
+    committedValues: Map<string, string>;
+    dirtyPaths: Set<string>;
+    elementValues: Map<string, string>;
+    setPaths: Set<string>;
+  }>({committedValues, dirtyPaths, elementValues, setPaths});
+  latestUiStateRef.current = {
+    committedValues,
+    dirtyPaths,
+    elementValues,
+    setPaths,
+  };
+
   useEffect(() => {
     if (prevDataRef.current === data) {
       return;
     }
     prevDataRef.current = data;
+
+    if (data.source === 'set') {
+      logger.debug(`GenericTreeView: Set reconciliation (${data.systemId})`, {
+        action: 'set-reconcile',
+        component: 'GenericTreeView',
+      });
+      const {arrayCounts: ac, elementValues: mergedValues} = seedFromData(data);
+      const {
+        committedValues: prevCommittedValues,
+        dirtyPaths: preSetDirtyPaths,
+        elementValues: sentValues,
+        setPaths: prevSetPaths,
+      } = latestUiStateRef.current;
+
+      const nextDirtyPaths = new Set(preSetDirtyPaths);
+      const nextSetPaths = new Set(prevSetPaths);
+      const nextElementValues = new Map(sentValues);
+      const nextCommittedValues = new Map(prevCommittedValues);
+      for (const path of preSetDirtyPaths) {
+        const sentValue = sentValues.get(path);
+        const mergedValue = mergedValues.get(path);
+        if (mergedValue !== undefined && mergedValue === sentValue) {
+          nextDirtyPaths.delete(path);
+          nextSetPaths.add(path);
+          nextElementValues.set(path, mergedValue);
+          nextCommittedValues.set(path, mergedValue);
+        }
+      }
+
+      setElementValues(nextElementValues);
+      setCommittedValues(nextCommittedValues);
+      setArrayCounts(ac);
+      setDirtyPaths(nextDirtyPaths);
+      setSetPaths(nextSetPaths);
+      setResetKey((k) => k + 1);
+      onUiStateChange?.({
+        arrayCounts: Object.fromEntries(ac),
+        committedValues: Object.fromEntries(nextCommittedValues),
+        dirtyPaths: [...nextDirtyPaths],
+        elementValues: Object.fromEntries(nextElementValues),
+        setPaths: [...nextSetPaths],
+      });
+      return;
+    }
+
     logger.debug(`GenericTreeView: data re-seed (${data.systemId})`, {
       action: 'data-re-seed',
       component: 'GenericTreeView',
@@ -150,6 +214,23 @@ function GenericTreeViewInner(
   );
   const [legacyExpandAll, setLegacyExpandAll] = useState(false);
   const [modernExpandAll, setModernExpandAll] = useState(false);
+
+  // Without initialUiState, selectedIds/expandedIds above auto-select the
+  // first param locally, but that choice never reaches the store — a later
+  // unrelated patch (e.g. {viewMode}) then merges onto a still-undefined
+  // uiState and freezes selectedIds at the createDefaultTreeViewUiState()
+  // fallback of []. Sync the auto-selection out once so the store always
+  // reflects what's actually selected on screen.
+  const hasSyncedAutoSelectionRef = useRef(false);
+  useEffect(() => {
+    if (hasSyncedAutoSelectionRef.current) {
+      return;
+    }
+    hasSyncedAutoSelectionRef.current = true;
+    if (initialUiState === undefined) {
+      onUiStateChange?.({expandedIds, selectedIds});
+    }
+  }, [expandedIds, selectedIds, initialUiState, onUiStateChange]);
 
   const [searchInput, setSearchInput] = useState(
     () => initialUiState?.searchText ?? '',
@@ -203,6 +284,12 @@ function GenericTreeViewInner(
   );
   const [showBadges, setShowBadges] = useState(
     () => initialUiState?.showBadges ?? false,
+  );
+  const [showModifiedOnly, setShowModifiedOnly] = useState(
+    () => initialUiState?.showModifiedOnly ?? false,
+  );
+  const [showErrorsOnly, setShowErrorsOnly] = useState(
+    () => initialUiState?.showErrorsOnly ?? false,
   );
 
   const [panelSplitPct, setPanelSplitPct] = useState(
@@ -349,25 +436,39 @@ function GenericTreeViewInner(
 
   const setItemIds = useMemo(() => itemIdsFromPaths(setPaths), [setPaths]);
 
-  const buildDirtyItems = useCallback((): TreeViewItem[] => {
-    if (dirtyPaths.size === 0) {
-      return [];
-    }
-    return data.items
-      .filter((item) =>
-        [...dirtyPaths].some((k) => k.startsWith(`${item.id}/`)),
-      )
-      .map((item) => ({
-        ...item,
-        elements: patchElements(
-          item.elements,
-          item.id,
-          [],
-          elementValues,
-          arrayCounts,
-        ),
-      }));
-  }, [dirtyPaths, data.items, elementValues, arrayCounts]);
+  const invalidItemIds = useMemo(
+    () => itemIdsFromPaths(invalidPaths),
+    [invalidPaths],
+  );
+
+  const visibleItems = useMemo(
+    () =>
+      data.items.filter((item) => {
+        if (item.isHidden) {
+          return false;
+        }
+        if (showModifiedOnly && !dirtyItemIds.has(item.id)) {
+          return false;
+        }
+        if (showErrorsOnly && !invalidItemIds.has(item.id)) {
+          return false;
+        }
+        return true;
+      }),
+    [
+      data.items,
+      showModifiedOnly,
+      showErrorsOnly,
+      dirtyItemIds,
+      invalidItemIds,
+    ],
+  );
+
+  const buildDirtyItems = useCallback(
+    (): TreeViewItem[] =>
+      buildDirtyItemsFrom(data.items, dirtyPaths, elementValues, arrayCounts),
+    [dirtyPaths, data.items, elementValues, arrayCounts],
+  );
 
   const tryAutoCommit = useCallback(() => {
     if (!autoCommit || readOnly) {
@@ -392,11 +493,12 @@ function GenericTreeViewInner(
     expandedIds: string[];
     selectedIds: string[];
   } | null>(null);
-
-  const currentSelectionRef = useRef({expandedIds, selectedIds});
-  useEffect(() => {
-    currentSelectionRef.current = {expandedIds, selectedIds};
-  });
+  // Latest selectedIds/expandedIds, read inside the effect below instead of
+  // via closure — the effect must not re-run when selection/expansion change
+  // as a result of its own setSelectedIds/setExpandedIds calls, only when
+  // searchText or matchSets change.
+  const latestSelectionRef = useRef({expandedIds, selectedIds});
+  latestSelectionRef.current = {expandedIds, selectedIds};
 
   useEffect(() => {
     if (!searchText) {
@@ -408,9 +510,11 @@ function GenericTreeViewInner(
       return;
     }
     if (!preSearchRef.current) {
+      const {expandedIds: prevExpandedIds, selectedIds: prevSelectedIds} =
+        latestSelectionRef.current;
       preSearchRef.current = {
-        expandedIds: [...currentSelectionRef.current.expandedIds],
-        selectedIds: [...currentSelectionRef.current.selectedIds],
+        expandedIds: [...prevExpandedIds],
+        selectedIds: [...prevSelectedIds],
       };
     }
     if (!matchSets) {
@@ -421,7 +525,7 @@ function GenericTreeViewInner(
       .map((p) => p.id);
     setSelectedIds(matchedIds);
     setExpandedIds(matchedIds);
-  }, [searchText, matchSets, data.items]);
+  }, [data, searchText, matchSets]);
 
   const handleCollapseAll = useCallback(() => {
     if (viewMode === 'modern') {
@@ -510,11 +614,11 @@ function GenericTreeViewInner(
   );
 
   const selectedItems = useMemo(() => {
-    const itemsById = new Map(data.items.map((p) => [p.id, p]));
+    const itemsById = new Map(visibleItems.map((p) => [p.id, p]));
     return selectedIds
       .map((id) => itemsById.get(id))
       .filter((item): item is TreeViewItem => item !== undefined);
-  }, [selectedIds, data]);
+  }, [selectedIds, visibleItems]);
 
   useImperativeHandle(
     ref,
@@ -583,6 +687,22 @@ function GenericTreeViewInner(
     [onUiStateChange],
   );
 
+  const handleShowModifiedOnlyChange = useCallback(
+    (show: boolean) => {
+      setShowModifiedOnly(show);
+      onUiStateChange?.({showModifiedOnly: show});
+    },
+    [onUiStateChange],
+  );
+
+  const handleShowErrorsOnlyChange = useCallback(
+    (show: boolean) => {
+      setShowErrorsOnly(show);
+      onUiStateChange?.({showErrorsOnly: show});
+    },
+    [onUiStateChange],
+  );
+
   return (
     <div
       className={['relative flex h-full w-full flex-col', className]
@@ -602,18 +722,24 @@ function GenericTreeViewInner(
       >
         {!hideToolbar && (
           <Toolbar
+            dirtyPaths={dirtyPaths}
+            invalidPaths={invalidPaths}
             isExpanding={isExpanding}
             onCollapseAll={handleCollapseAll}
             onExpandAll={handleExpandAll}
             onPolicyFilterChange={handlePolicyFilterChange}
             onSearchChange={handleSearchChange}
             onShowBadgesChange={handleShowBadgesChange}
+            onShowErrorsOnlyChange={handleShowErrorsOnlyChange}
+            onShowModifiedOnlyChange={handleShowModifiedOnlyChange}
             onShowPidsChange={handleShowPidsChange}
             onShowRangesChange={handleShowRangesChange}
             onViewModeChange={handleViewModeChange}
             policyFilter={policyFilter}
             searchText={searchInput}
             showBadges={showBadges}
+            showErrorsOnly={showErrorsOnly}
+            showModifiedOnly={showModifiedOnly}
             showPids={showPids}
             showRanges={showRanges}
             viewMode={viewMode}
@@ -629,7 +755,7 @@ function GenericTreeViewInner(
               <div className="h-full" style={{width: `${panelSplitPct}%`}}>
                 <ParameterListPanel
                   dirtyItemIds={dirtyItemIds}
-                  items={data.items}
+                  items={visibleItems}
                   matchSets={matchSets}
                   moduleName={title}
                   onSelectionChange={handleSelectionChange}
@@ -689,7 +815,7 @@ function GenericTreeViewInner(
                 expandAll={legacyExpandAll}
                 expandedKeys={legacyExpandedKeys}
                 invalidPaths={invalidPaths}
-                items={data.items}
+                items={visibleItems}
                 matchSets={matchSets}
                 moduleName={title}
                 onAutoCommit={tryAutoCommit}
